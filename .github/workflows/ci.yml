@@ -1,0 +1,75 @@
+name: CI-CD
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+      - name: Build
+        run: go build ./...
+      - name: Test
+        run: go test ./...
+
+  docker-deploy:
+    needs: build-test
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      AWS_REGION: us-east-1
+      ECR_REPO: resume-app
+      IMAGE_TAG: latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_IAM_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Build image
+        run: docker build -t $ECR_REPO:$IMAGE_TAG .
+      - name: Tag image
+        run: |
+          REPO_URL=$(aws ecr describe-repositories --repository-names $ECR_REPO --query 'repositories[0].repositoryUri' --output text)
+          docker tag $ECR_REPO:$IMAGE_TAG $REPO_URL:$IMAGE_TAG
+          echo "REPO_URL=$REPO_URL" >> $GITHUB_ENV
+      - name: Push image
+        run: docker push $REPO_URL:$IMAGE_TAG
+      - name: Update k8s deployment image
+        run: |
+          sed -i "s#<ECR_REPO_URI>:latest#$REPO_URL:$IMAGE_TAG#g" k8s/deployment.yaml
+      - name: Deploy to cluster
+        uses: azure/k8s-deploy@v5
+        with:
+          action: deploy
+          manifests: |
+            k8s/namespace.yaml
+            k8s/configmap.yaml
+            k8s/secret.yaml
+            k8s/deployment.yaml
+            k8s/service.yaml
+          kubectl-version: 'v1.29.0'
+          namespace: resume-app
+          # cluster credentials provided via secrets (KUBECONFIG or others)
